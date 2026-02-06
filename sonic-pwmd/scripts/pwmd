@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+
+"""
+    pwmd
+    PWM information update daemon for SONiC
+    This daemon will loop to collect PWM related information and then write the information to state DB.
+    It monitors the PWM value and tracks minimum/maximum values with timestamps.
+    The loop interval is PWM_INFO_UPDATE_PERIOD_SECS in seconds.
+"""
+
+import signal
+import sys
+import threading
+from datetime import datetime
+
+from sonic_py_common import daemon_base, logger
+from swsscommon import swsscommon
+
+
+#
+# Constants ====================================================================
+#
+
+SIGNALS_TO_NAMES_DICT = dict((getattr(signal, n), n)
+                             for n in dir(signal) if n.startswith('SIG') and '_' not in n)
+
+SYSLOG_IDENTIFIER = "pwmd"
+
+PWM_INFO_TABLE = 'PWM_INFO'
+PWM_INFO_KEY_TEMPLATE = 'PWM {}'
+
+PWM_INFO_NAME_FIELD = 'name'
+PWM_INFO_VALUE_FIELD = 'value'
+PWM_INFO_STATUS_FIELD = 'status'
+PWM_INFO_MIN_VALUE_FIELD = 'minimum_value'
+PWM_INFO_MIN_VALUE_TIMESTAMP_FIELD = 'minimum_value_timestamp'
+PWM_INFO_MAX_VALUE_FIELD = 'maximum_value'
+PWM_INFO_MAX_VALUE_TIMESTAMP_FIELD = 'maximum_value_timestamp'
+PWM_INFO_MIN_THRESHOLD_FIELD = 'min_threshold'
+PWM_INFO_MAX_THRESHOLD_FIELD = 'max_threshold'
+PWM_INFO_TIMESTAMP_FIELD = 'timestamp'
+
+PWM_STATUS_OK = 'OK'
+PWM_STATUS_NOT_OK = 'NOT_OK'
+
+NOT_AVAILABLE = 'N/A'
+
+PWM_INFO_UPDATE_PERIOD_SECS = 1
+
+platform_chassis = None
+
+exit_code = 0
+
+
+def try_get(callback, default=None):
+    """
+    Handy function to invoke the callback and catch NotImplementedError
+    :param callback: Callback to be invoked
+    :param default: Default return value if exception occur
+    :return: Default return value if exception occur else return value of the callback
+    """
+    try:
+        ret = callback()
+        if ret is None:
+            ret = default
+    except NotImplementedError:
+        ret = default
+    except Exception:
+        ret = default
+
+    return ret
+
+
+#
+# PWM Status ===================================================================
+#
+
+class PwmStatus(object):
+    """
+    Class to track PWM status and historical min/max values
+    """
+    def __init__(self, logger, pwm):
+        self.pwm = pwm
+        self.logger = logger
+        self.current_value = 0
+        self.min_value = None
+        self.min_value_timestamp = None
+        self.max_value = None
+        self.max_value_timestamp = None
+        self.status = PWM_STATUS_OK
+        self.previous_status = PWM_STATUS_OK
+
+    def update_value(self, value):
+        """
+        Update PWM value and track min/max values with timestamps
+        :param value: Current PWM value
+        :return: True if min or max value was updated
+        """
+        self.current_value = value
+        current_time = datetime.now().strftime('%Y%m%d %H:%M:%S')
+        value_updated = False
+
+        # Update minimum value if current value is lower
+        if self.min_value is None or value < self.min_value:
+            self.min_value = value
+            self.min_value_timestamp = current_time
+            value_updated = True
+
+        # Update maximum value if current value is higher
+        if self.max_value is None or value > self.max_value:
+            self.max_value = value
+            self.max_value_timestamp = current_time
+            value_updated = True
+
+        return value_updated
+
+    def check_threshold(self, min_threshold, max_threshold):
+        """
+        Check if current value is within thresholds
+        :param min_threshold: Minimum threshold value
+        :param max_threshold: Maximum threshold value
+        :return: True if status changed
+        """
+        self.previous_status = self.status
+
+        if self.current_value < min_threshold or self.current_value > max_threshold:
+            self.status = PWM_STATUS_NOT_OK
+        else:
+            self.status = PWM_STATUS_OK
+
+        return self.status != self.previous_status
+
+    def is_ok(self):
+        return self.status == PWM_STATUS_OK
+
+
+#
+# Daemon =======================================================================
+#
+
+class DaemonPwmd(daemon_base.DaemonBase):
+    def __init__(self, log_identifier):
+        super(DaemonPwmd, self).__init__(log_identifier)
+
+        # Set minimum logging level to INFO
+        self.set_min_log_priority_info()
+
+        self.stop_event = threading.Event()
+        self.pwm_tbl = None
+        self.pwm_status = None
+        self.pwm = None
+        self.first_run = True
+
+        global platform_chassis
+
+        # Load new platform api class
+        try:
+            import sonic_platform.platform
+            platform_chassis = sonic_platform.platform.Platform().get_chassis()
+        except Exception as e:
+            self.log_error("Failed to load chassis due to {}".format(repr(e)))
+            sys.exit(1)
+
+        # Get PWM object from chassis
+        try:
+            self.pwm = platform_chassis.get_pwm()
+        except Exception as e:
+            self.log_error("Failed to get PWM from chassis: {}".format(repr(e)))
+            sys.exit(1)
+
+        if self.pwm is None:
+            self.log_error("PWM not available on this platform")
+            sys.exit(1)
+
+        # Connect to STATE_DB and create PWM info table
+        state_db = daemon_base.db_connect("STATE_DB")
+        self.pwm_tbl = swsscommon.Table(state_db, PWM_INFO_TABLE)
+
+        # Initialize PWM status tracker
+        self.pwm_status = PwmStatus(self, self.pwm)
+
+        self.log_info("PWM daemon initialized successfully")
+
+    def __del__(self):
+        # Delete all the information from DB and then exit
+        if self.pwm_tbl is not None and self.pwm is not None:
+            pwm_name = try_get(self.pwm.get_name, 'pwm')
+            self.pwm_tbl._del(pwm_name)
+
+    # Override signal handler from DaemonBase
+    def signal_handler(self, sig, frame):
+        FATAL_SIGNALS = [signal.SIGINT, signal.SIGTERM]
+        NONFATAL_SIGNALS = [signal.SIGHUP]
+
+        global exit_code
+
+        if sig in FATAL_SIGNALS:
+            self.log_info("Caught signal '{}' - exiting...".format(SIGNALS_TO_NAMES_DICT[sig]))
+            exit_code = 128 + sig  # Make sure we exit with a non-zero code so that supervisor will try to restart us
+            self.stop_event.set()
+        elif sig in NONFATAL_SIGNALS:
+            self.log_info("Caught signal '{}' - ignoring...".format(SIGNALS_TO_NAMES_DICT[sig]))
+        else:
+            self.log_warning("Caught unhandled signal '{}' - ignoring...".format(SIGNALS_TO_NAMES_DICT[sig]))
+
+    # Main daemon logic
+    def run(self):
+        if self.stop_event.wait(PWM_INFO_UPDATE_PERIOD_SECS):
+            # We received a fatal signal
+            return False
+
+        self.update_pwm_data()
+
+        if self.first_run:
+            self.first_run = False
+
+        return True
+
+    def update_pwm_data(self):
+        """
+        Update PWM data to STATE_DB
+        """
+        if not self.pwm:
+            return
+
+        try:
+            self._update_single_pwm_data()
+        except Exception as e:
+            self.log_warning("Failed to update PWM data - {}".format(e))
+
+    def _update_single_pwm_data(self):
+        """
+        Update single PWM device data
+        """
+        pwm_name = try_get(self.pwm.get_name, 'pwm')
+        pwm_value = try_get(self.pwm.get_pwm_value, 0)
+        min_threshold = try_get(self.pwm.get_pwm_min_threshold, 0)
+        max_threshold = try_get(self.pwm.get_pwm_max_threshold, 255)
+
+        # Update value and track min/max
+        self.pwm_status.update_value(pwm_value)
+
+        # Check thresholds and update status
+        status_changed = self.pwm_status.check_threshold(min_threshold, max_threshold)
+
+        # Log status change
+        if status_changed or self.first_run:
+            if self.pwm_status.is_ok():
+                self.log_notice(
+                    "PWM status OK: {} value {} is within thresholds [{}, {}]".format(
+                        pwm_name, pwm_value, min_threshold, max_threshold
+                    )
+                )
+            else:
+                self.log_error(
+                    "PWM status NOT_OK: {} value {} is outside thresholds [{}, {}]".format(
+                        pwm_name, pwm_value, min_threshold, max_threshold
+                    )
+                )
+
+        # Update STATE_DB
+        current_time = datetime.now().strftime('%Y%m%d %H:%M:%S')
+        fvs = swsscommon.FieldValuePairs([
+            (PWM_INFO_NAME_FIELD, str(pwm_name)),
+            (PWM_INFO_VALUE_FIELD, str(pwm_value)),
+            (PWM_INFO_STATUS_FIELD, self.pwm_status.status),
+            (PWM_INFO_MIN_VALUE_FIELD, str(self.pwm_status.min_value)),
+            (PWM_INFO_MIN_VALUE_TIMESTAMP_FIELD, str(self.pwm_status.min_value_timestamp)),
+            (PWM_INFO_MAX_VALUE_FIELD, str(self.pwm_status.max_value)),
+            (PWM_INFO_MAX_VALUE_TIMESTAMP_FIELD, str(self.pwm_status.max_value_timestamp)),
+            (PWM_INFO_MIN_THRESHOLD_FIELD, str(min_threshold)),
+            (PWM_INFO_MAX_THRESHOLD_FIELD, str(max_threshold)),
+            (PWM_INFO_TIMESTAMP_FIELD, current_time),
+        ])
+        self.pwm_tbl.set(pwm_name, fvs)
+
+
+#
+# Main =========================================================================
+#
+
+
+def main():
+    pwmd = DaemonPwmd(SYSLOG_IDENTIFIER)
+
+    pwmd.log_info("Starting up...")
+
+    while pwmd.run():
+        pass
+
+    pwmd.log_info("Shutting down...")
+
+    return exit_code
+
+
+if __name__ == '__main__':
+    sys.exit(main())
