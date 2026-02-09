@@ -4,11 +4,13 @@ Test pwmd daemon
 
 import os
 import sys
+import importlib.util
 from unittest import mock
 
 # Add tests directory to path for mock imports
 test_path = os.path.dirname(os.path.abspath(__file__))
 modules_path = os.path.dirname(test_path)
+scripts_path = os.path.join(modules_path, 'scripts')
 sys.path.insert(0, modules_path)
 sys.path.insert(0, os.path.join(test_path, 'mocked_libs'))
 
@@ -16,19 +18,32 @@ sys.path.insert(0, os.path.join(test_path, 'mocked_libs'))
 sys.modules['swsscommon'] = __import__('swsscommon')
 sys.modules['swsscommon.swsscommon'] = __import__('swsscommon.swsscommon')
 
+from .mock_platform import MockPwm, MockPlatform
+
+
+def load_pwmd_module():
+    """Load the pwmd script as a module"""
+    # Remove cached pwmd module to ensure fresh load with current mocks
+    if 'pwmd' in sys.modules:
+        del sys.modules['pwmd']
+
+    pwmd_path = os.path.join(scripts_path, 'pwmd')
+    spec = importlib.util.spec_from_loader('pwmd', loader=None, origin=pwmd_path)
+    pwmd_module = importlib.util.module_from_spec(spec)
+    with open(pwmd_path, 'r') as f:
+        code = compile(f.read(), pwmd_path, 'exec')
+        exec(code, pwmd_module.__dict__)
+    sys.modules['pwmd'] = pwmd_module
+    return pwmd_module
+
 
 class TestPwmStatus:
     """Test PwmStatus class"""
 
     def test_init(self):
         """Test PwmStatus initialization"""
-        from tests.mock_platform import MockPwm
-
         with mock.patch.dict(sys.modules, {'sonic_platform.platform': mock.MagicMock()}):
-            # Import after mocking
-            sys.path.insert(0, os.path.join(modules_path, 'scripts'))
-            import importlib
-            pwmd_module = importlib.import_module('pwmd')
+            pwmd_module = load_pwmd_module()
 
             pwm = MockPwm()
             logger = mock.MagicMock()
@@ -41,12 +56,8 @@ class TestPwmStatus:
 
     def test_update_value(self):
         """Test PwmStatus.update_value()"""
-        from tests.mock_platform import MockPwm
-
         with mock.patch.dict(sys.modules, {'sonic_platform.platform': mock.MagicMock()}):
-            sys.path.insert(0, os.path.join(modules_path, 'scripts'))
-            import importlib
-            pwmd_module = importlib.import_module('pwmd')
+            pwmd_module = load_pwmd_module()
 
             pwm = MockPwm()
             logger = mock.MagicMock()
@@ -82,12 +93,8 @@ class TestPwmStatus:
 
     def test_check_threshold(self):
         """Test PwmStatus.check_threshold()"""
-        from tests.mock_platform import MockPwm
-
         with mock.patch.dict(sys.modules, {'sonic_platform.platform': mock.MagicMock()}):
-            sys.path.insert(0, os.path.join(modules_path, 'scripts'))
-            import importlib
-            pwmd_module = importlib.import_module('pwmd')
+            pwmd_module = load_pwmd_module()
 
             pwm = MockPwm()
             logger = mock.MagicMock()
@@ -134,9 +141,7 @@ class TestTryGet:
     def test_try_get_success(self):
         """Test try_get with successful callback"""
         with mock.patch.dict(sys.modules, {'sonic_platform.platform': mock.MagicMock()}):
-            sys.path.insert(0, os.path.join(modules_path, 'scripts'))
-            import importlib
-            pwmd_module = importlib.import_module('pwmd')
+            pwmd_module = load_pwmd_module()
 
             result = pwmd_module.try_get(lambda: 42, default=0)
             assert result == 42
@@ -144,9 +149,7 @@ class TestTryGet:
     def test_try_get_not_implemented(self):
         """Test try_get with NotImplementedError"""
         with mock.patch.dict(sys.modules, {'sonic_platform.platform': mock.MagicMock()}):
-            sys.path.insert(0, os.path.join(modules_path, 'scripts'))
-            import importlib
-            pwmd_module = importlib.import_module('pwmd')
+            pwmd_module = load_pwmd_module()
 
             def raise_not_implemented():
                 raise NotImplementedError()
@@ -157,9 +160,7 @@ class TestTryGet:
     def test_try_get_none_returns_default(self):
         """Test try_get when callback returns None"""
         with mock.patch.dict(sys.modules, {'sonic_platform.platform': mock.MagicMock()}):
-            sys.path.insert(0, os.path.join(modules_path, 'scripts'))
-            import importlib
-            pwmd_module = importlib.import_module('pwmd')
+            pwmd_module = load_pwmd_module()
 
             result = pwmd_module.try_get(lambda: None, default=99)
             assert result == 99
@@ -168,27 +169,40 @@ class TestTryGet:
 class TestDaemonPwmd:
     """Test DaemonPwmd class"""
 
+    def _create_mock_platform_module(self, mock_pwm):
+        """Create a properly configured mock platform module"""
+        mock_chassis = mock.MagicMock()
+        mock_chassis.get_pwm.return_value = mock_pwm
+
+        mock_platform_instance = mock.MagicMock()
+        mock_platform_instance.get_chassis.return_value = mock_chassis
+
+        # Create mock platform module and configure Platform() to return our instance
+        mock_platform_module = mock.MagicMock()
+        mock_platform_module.Platform.return_value = mock_platform_instance
+
+        # Create parent mock and link to platform module
+        mock_sonic_platform = mock.MagicMock()
+        mock_sonic_platform.platform = mock_platform_module
+
+        return mock_sonic_platform, mock_platform_module
+
     @mock.patch('sonic_py_common.daemon_base.db_connect')
     @mock.patch('sonic_py_common.daemon_base.DaemonBase.__init__')
     def test_daemon_init(self, mock_daemon_init, mock_db_connect):
         """Test DaemonPwmd initialization"""
-        from tests.mock_platform import MockPlatform
-
         mock_daemon_init.return_value = None
         mock_db_connect.return_value = mock.MagicMock()
 
-        with mock.patch.dict(sys.modules, {
-            'sonic_platform': mock.MagicMock(),
-            'sonic_platform.platform': mock.MagicMock()
-        }):
-            sys.path.insert(0, os.path.join(modules_path, 'scripts'))
-            import importlib
-            pwmd_module = importlib.import_module('pwmd')
+        # Create mock PWM
+        mock_pwm = MockPwm()
+        mock_sonic_platform, mock_platform_module = self._create_mock_platform_module(mock_pwm)
 
-            # Mock platform
-            mock_platform = MockPlatform()
-            pwmd_module.sonic_platform = mock.MagicMock()
-            pwmd_module.sonic_platform.platform.Platform.return_value = mock_platform
+        with mock.patch.dict(sys.modules, {
+            'sonic_platform': mock_sonic_platform,
+            'sonic_platform.platform': mock_platform_module
+        }):
+            pwmd_module = load_pwmd_module()
 
             with mock.patch.object(pwmd_module.DaemonPwmd, 'set_min_log_priority_info'):
                 with mock.patch.object(pwmd_module.DaemonPwmd, 'log_info'):
@@ -202,30 +216,19 @@ class TestDaemonPwmd:
     @mock.patch('sonic_py_common.daemon_base.DaemonBase.__init__')
     def test_update_pwm_data(self, mock_daemon_init, mock_db_connect):
         """Test _update_single_pwm_data method"""
-        from tests.mock_platform import MockPlatform, MockPwm
-
         mock_daemon_init.return_value = None
         mock_db = mock.MagicMock()
         mock_db_connect.return_value = mock_db
 
+        # Create mock PWM with specific values
+        mock_pwm = MockPwm(name='test_pwm', value=128, min_threshold=0, max_threshold=255)
+        mock_sonic_platform, mock_platform_module = self._create_mock_platform_module(mock_pwm)
+
         with mock.patch.dict(sys.modules, {
-            'sonic_platform': mock.MagicMock(),
-            'sonic_platform.platform': mock.MagicMock()
+            'sonic_platform': mock_sonic_platform,
+            'sonic_platform.platform': mock_platform_module
         }):
-            sys.path.insert(0, os.path.join(modules_path, 'scripts'))
-            import importlib
-            pwmd_module = importlib.import_module('pwmd')
-
-            # Create mock PWM with specific values
-            mock_pwm = MockPwm(name='test_pwm', value=128, min_threshold=0, max_threshold=255)
-            mock_chassis = mock.MagicMock()
-            mock_chassis.get_pwm.return_value = mock_pwm
-
-            mock_platform = mock.MagicMock()
-            mock_platform.get_chassis.return_value = mock_chassis
-
-            pwmd_module.sonic_platform = mock.MagicMock()
-            pwmd_module.sonic_platform.platform.Platform.return_value = mock_platform
+            pwmd_module = load_pwmd_module()
 
             with mock.patch.object(pwmd_module.DaemonPwmd, 'set_min_log_priority_info'):
                 with mock.patch.object(pwmd_module.DaemonPwmd, 'log_info'):
@@ -245,30 +248,19 @@ class TestDaemonPwmd:
     @mock.patch('sonic_py_common.daemon_base.DaemonBase.__init__')
     def test_threshold_violation_logging(self, mock_daemon_init, mock_db_connect):
         """Test that threshold violations are logged"""
-        from tests.mock_platform import MockPwm
-
         mock_daemon_init.return_value = None
         mock_db = mock.MagicMock()
         mock_db_connect.return_value = mock_db
 
+        # Create mock PWM with value outside threshold
+        mock_pwm = MockPwm(name='test_pwm', value=300, min_threshold=0, max_threshold=255)
+        mock_sonic_platform, mock_platform_module = self._create_mock_platform_module(mock_pwm)
+
         with mock.patch.dict(sys.modules, {
-            'sonic_platform': mock.MagicMock(),
-            'sonic_platform.platform': mock.MagicMock()
+            'sonic_platform': mock_sonic_platform,
+            'sonic_platform.platform': mock_platform_module
         }):
-            sys.path.insert(0, os.path.join(modules_path, 'scripts'))
-            import importlib
-            pwmd_module = importlib.import_module('pwmd')
-
-            # Create mock PWM with value outside threshold
-            mock_pwm = MockPwm(name='test_pwm', value=300, min_threshold=0, max_threshold=255)
-            mock_chassis = mock.MagicMock()
-            mock_chassis.get_pwm.return_value = mock_pwm
-
-            mock_platform = mock.MagicMock()
-            mock_platform.get_chassis.return_value = mock_chassis
-
-            pwmd_module.sonic_platform = mock.MagicMock()
-            pwmd_module.sonic_platform.platform.Platform.return_value = mock_platform
+            pwmd_module = load_pwmd_module()
 
             with mock.patch.object(pwmd_module.DaemonPwmd, 'set_min_log_priority_info'):
                 with mock.patch.object(pwmd_module.DaemonPwmd, 'log_info'):

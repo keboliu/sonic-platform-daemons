@@ -2,6 +2,8 @@
 Mock swsscommon.swsscommon module
 """
 
+STATE_DB = ''
+
 
 class FieldValuePairs(list):
     """Mock FieldValuePairs class"""
@@ -35,3 +37,18 @@ class Table:
 
     def getKeys(self):
         return list(self._data.keys())
+
+
+class ConfigDBConnector:
+    """Mock ConfigDBConnector class"""
+    pass
+
+
+class SonicDBConfig:
+    """Mock SonicDBConfig class"""
+    pass
+
+
+class SonicV2Connector:
+    """Mock SonicV2Connector class"""
+    pass
